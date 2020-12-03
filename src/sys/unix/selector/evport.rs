@@ -111,15 +111,20 @@ impl Selector {
             timeout as *mut ::libc::timespec,
         ))?;
 
+        // If port_getn() succeeds, nget will contain the number of
+        // entries, so this is safe.
         unsafe { events.set_len(nget as usize) };
 
         let mut reassociate = false;
 
         let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
-        for evt in events.iter_mut() {
+        for evt in events.iter() {
             if evt.portev_source as c_int == libc::PORT_SOURCE_USER {
                 continue;
             }
+
+            // Only fds are supported for now
+            assert!(evt.portev_source as c_int == libc::PORT_SOURCE_FD);
 
             let ti = fd_to_reassociate_lock.get_mut(&(evt.portev_object as RawFd));
 
@@ -146,13 +151,16 @@ impl Selector {
         let mut flags = 0;
 
         if interests.is_readable() {
-            flags |= POLLIN | POLLHUP;
+            flags |= POLLIN;
         }
 
         if interests.is_writable() {
-            flags |= POLLOUT | POLLHUP;
+            flags |= POLLOUT;
         }
 
+        // Since we need to re-arm the fd after we get an event, we need
+        // to keep track of the flags used when registering so that we can
+        // re-associate the fd with the same flags after an event is received
         let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
         fd_to_reassociate_lock
             .entry(fd)
@@ -198,7 +206,7 @@ impl Selector {
     }
 
     pub fn wake(&self, token: Token) -> io::Result<()> {
-        syscall!(port_send(self.port, 0, token.0 as *mut libc::c_void,)).map(|_| ())
+        syscall!(port_send(self.port, 0, token.0 as *mut libc::c_void)).map(|_| ())
     }
 }
 
