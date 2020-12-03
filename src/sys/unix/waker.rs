@@ -98,12 +98,44 @@ mod kqueue {
 #[cfg(any(target_os = "freebsd", target_os = "ios", target_os = "macos"))]
 pub use self::kqueue::Waker;
 
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+mod evport {
+    use crate::sys::Selector;
+    use crate::Token;
+
+    use std::io;
+
+    /// Waker backed by event port user notifications (`PORT_SOURCE_USER`).
+    ///
+    /// This is very simple -- we just generate a user event and set the
+    /// user data to the token value.
+    #[derive(Debug)]
+    pub struct Waker {
+        selector: Selector,
+        token: Token,
+    }
+
+    impl Waker {
+        pub fn new(selector: &Selector, token: Token) -> io::Result<Waker> {
+            selector.try_clone().and_then(|selector| {
+                Ok(Waker { selector, token })
+            })
+        }
+
+        pub fn wake(&self) -> io::Result<()> {
+            self.selector.wake(self.token)
+        }
+    }
+}
+
+
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+pub use self::evport::Waker;
+
 #[cfg(any(
     target_os = "dragonfly",
-    target_os = "illumos",
     target_os = "netbsd",
     target_os = "openbsd",
-    target_os = "solaris"
 ))]
 mod pipe {
     use crate::sys::unix::Selector;
@@ -172,9 +204,7 @@ mod pipe {
 
 #[cfg(any(
     target_os = "dragonfly",
-    target_os = "illumos",
     target_os = "netbsd",
     target_os = "openbsd",
-    target_os = "solaris"
 ))]
 pub use self::pipe::Waker;

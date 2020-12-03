@@ -1,16 +1,12 @@
 #[cfg(any(
     target_os = "android",
-    target_os = "illumos",
-    target_os = "linux",
-    target_os = "solaris"
+    target_os = "linux"
 ))]
 mod epoll;
 
 #[cfg(any(
     target_os = "android",
-    target_os = "illumos",
-    target_os = "linux",
-    target_os = "solaris"
+    target_os = "linux"
 ))]
 pub(crate) use self::epoll::{event, Event, Events, Selector};
 
@@ -33,3 +29,11 @@ mod kqueue;
     target_os = "openbsd"
 ))]
 pub(crate) use self::kqueue::{event, Event, Events, Selector};
+
+mod evport;
+
+#[cfg(any(
+    target_os = "illumos",
+    target_os = "solaris"
+))]
+pub(crate) use self::evport::{event, Event, Events, Selector};
