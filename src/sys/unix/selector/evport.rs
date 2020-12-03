@@ -9,9 +9,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::{cmp, io, ptr};
 
+use libc::PORT_SOURCE_FD;
 use libc::{self, c_int, c_uint};
-use libc::{POLLIN, POLLOUT, POLLHUP};
-use libc::{PORT_SOURCE_FD};
+use libc::{POLLHUP, POLLIN, POLLOUT};
 
 #[cfg(debug_assertions)]
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -89,7 +89,7 @@ impl Selector {
             let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
             for (fd, ti) in fd_to_reassociate_lock.iter_mut() {
                 if ti.needs_rearm {
-                   syscall!(port_associate(
+                    syscall!(port_associate(
                         self.port,
                         PORT_SOURCE_FD,
                         *fd as usize,
@@ -117,9 +117,13 @@ impl Selector {
 
         let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
         for evt in events.iter_mut() {
+            if evt.portev_source as c_int == libc::PORT_SOURCE_USER {
+                continue;
+            }
+
             let ti = fd_to_reassociate_lock.get_mut(&(evt.portev_object as RawFd));
 
-            if (evt.portev_events & POLLHUP as i32) != 0 {
+            if (evt.portev_events & POLLHUP as c_int) != 0 {
                 fd_to_reassociate_lock.remove(&(evt.portev_object as RawFd));
             } else {
                 ti.unwrap().needs_rearm = true;
@@ -129,6 +133,10 @@ impl Selector {
 
         if reassociate {
             self.has_fd_to_reassociate.store(true, Ordering::Relaxed);
+        }
+
+        if fd_to_reassociate_lock.len() == 0 {
+            self.has_fd_to_reassociate.store(false, Ordering::Relaxed);
         }
 
         Ok(())
@@ -142,17 +150,18 @@ impl Selector {
         }
 
         if interests.is_writable() {
-            flags |= POLLOUT;
+            flags |= POLLOUT | POLLHUP;
         }
 
         let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
-        fd_to_reassociate_lock.entry(fd).or_insert(
-            TokenInfo {
+        fd_to_reassociate_lock
+            .entry(fd)
+            .and_modify(|ti| ti.flags = flags as c_int)
+            .or_insert(TokenInfo {
                 token: token,
                 flags: flags as c_int,
                 needs_rearm: false,
-            }
-        );
+            });
 
         syscall!(port_associate(
             self.port,
@@ -160,7 +169,8 @@ impl Selector {
             fd as usize,
             flags as i32,
             token.0 as *mut libc::c_void,
-        )).map(|_| ())
+        ))
+        .map(|_| ())
     }
 
     pub fn reregister(&self, fd: RawFd, token: Token, interests: Interest) -> io::Result<()> {
@@ -168,20 +178,18 @@ impl Selector {
     }
 
     pub fn deregister(&self, fd: RawFd) -> io::Result<()> {
-        if self.has_fd_to_reassociate.load(Ordering::Acquire) {
-            let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
-
-            fd_to_reassociate_lock.remove(&fd);
-            if fd_to_reassociate_lock.len() == 0 {
-                self.has_fd_to_reassociate.store(false, Ordering::Relaxed);
-            }
+        let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
+        fd_to_reassociate_lock.remove(&fd);
+        if fd_to_reassociate_lock.len() == 0 {
+            self.has_fd_to_reassociate.store(false, Ordering::Relaxed);
         }
 
         syscall!(port_dissociate(
             self.port,
             libc::PORT_SOURCE_FD,
             fd as libc::uintptr_t
-        )).map(|_| ())
+        ))
+        .map(|_| ())
     }
 
     #[cfg(debug_assertions)]
@@ -190,11 +198,7 @@ impl Selector {
     }
 
     pub fn wake(&self, token: Token) -> io::Result<()> {
-        syscall!(port_send(
-            self.port,
-            0,
-            token.0 as *mut libc::c_void,
-        )).map(|_| ())
+        syscall!(port_send(self.port, 0, token.0 as *mut libc::c_void,)).map(|_| ())
     }
 }
 
@@ -260,13 +264,13 @@ pub mod event {
     }
 
     pub fn is_readable(event: &Event) -> bool {
-        (event.portev_events & libc::POLLIN as c_int) != 0 &&
-        event.portev_source as c_int == libc::PORT_SOURCE_FD
+        (event.portev_events & libc::POLLIN as c_int) != 0
+            && event.portev_source as c_int == libc::PORT_SOURCE_FD
     }
 
     pub fn is_writable(event: &Event) -> bool {
-        (event.portev_events & libc::POLLOUT as c_int) != 0 &&
-        event.portev_source as c_int == libc::PORT_SOURCE_FD
+        (event.portev_events & libc::POLLOUT as c_int) != 0
+            && event.portev_source as c_int == libc::PORT_SOURCE_FD
     }
 
     pub fn is_error(_: &Event) -> bool {
@@ -274,13 +278,13 @@ pub mod event {
     }
 
     pub fn is_read_closed(event: &Event) -> bool {
-        (event.portev_events & libc::POLLHUP as c_int) != 0 &&
-        event.portev_source as c_int == libc::PORT_SOURCE_FD
+        (event.portev_events & libc::POLLHUP as c_int) != 0
+            && event.portev_source as c_int == libc::PORT_SOURCE_FD
     }
 
     pub fn is_write_closed(event: &Event) -> bool {
-        (event.portev_events & libc::POLLHUP as c_int) != 0 &&
-        event.portev_source as c_int == libc::PORT_SOURCE_FD
+        (event.portev_events & libc::POLLHUP as c_int) != 0
+            && event.portev_source as c_int == libc::PORT_SOURCE_FD
     }
 
     pub fn is_priority(_: &Event) -> bool {
@@ -313,20 +317,20 @@ pub mod event {
             (got & *want as c_int) != 0
         }
 
-        debug_detail!(
-            EventDetails(c_int),
-            check_flag,
-            libc::POLLIN,
-            libc::POLLOUT,
-        );
-
+        debug_detail!(EventDetails(c_int), check_flag, libc::POLLIN, libc::POLLOUT,);
 
         let object = event.portev_object;
         let user = event.portev_user;
 
         f.debug_struct("port_event")
-            .field("portev_events", &EventDetails(event.portev_events as libc::c_int))
-            .field("portev_source", &SourceDetails(event.portev_source as libc::c_int))
+            .field(
+                "portev_events",
+                &EventDetails(event.portev_events as libc::c_int),
+            )
+            .field(
+                "portev_source",
+                &SourceDetails(event.portev_source as libc::c_int),
+            )
             .field("portev_object", &object)
             .field("portev_user", &user)
             .finish()
