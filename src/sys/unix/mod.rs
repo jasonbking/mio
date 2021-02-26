@@ -32,6 +32,7 @@ cfg_os_poll! {
         pub use self::uds::SocketAddr;
     }
 
+    #[cfg(not(any(target_os = "illumos", target_os = "solaris")))]
     cfg_io_source! {
         use std::io;
 
@@ -50,6 +51,93 @@ cfg_os_poll! {
                 // We don't hold state, so we can just call the function and
                 // return.
                 f(io)
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+    cfg_io_source! {
+        use std::io;
+        use std::sync::Arc;
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::io::RawFd;
+
+        use crate::{poll, Interest, Registry, Token};
+
+        struct InternalState {
+            selector: Arc<Selector>,
+            token: Token,
+            interests: Interest,
+        }
+
+        pub struct IoSourceState {
+            inner: Option<Box<InternalState>>,
+        }
+
+        impl IoSourceState {
+            pub fn new() -> IoSourceState {
+                IoSourceState { inner: None }
+            }
+
+            pub fn do_io<T, F, R>(&self, f: F, io: &T) -> io::Result<R>
+            where
+                F: FnOnce(&T) -> io::Result<R>,
+                T: AsRawFd,
+            {
+                let result = f(io);
+                self.inner.as_ref().map_or(Ok(()), |state| {
+                    state
+                        .selector
+                        .reregister(io.as_raw_fd(), state.token, state.interests)
+                })?;
+                result
+            }
+
+            pub fn register(
+                &mut self,
+                registry: &Registry,
+                token: Token,
+                interests: Interest,
+                socket: RawFd,
+            ) -> io::Result<()> {
+                if self.inner.is_some() {
+                    Err(io::ErrorKind::AlreadyExists.into())
+                } else {
+                    poll::selector(registry)
+                        .register(socket, token, interests)
+                        .map(|state| {
+                            self.inner = Some(Box::new(state));
+                        })
+                }
+            }
+
+            pub fn reregister(
+                &mut self,
+                registry: &Registry,
+                token: Token,
+                interests: Interest,
+            ) -> io::Result<()> {
+                match self.inner.as_mut() {
+                    Some(state) => {
+                        poll::selector(registry)
+                            .reregister(xx, token, interests)
+                            .map(|()| {
+                                state.token = token;
+                                state.interests = interests;
+                            })
+                        }
+                        None => Err(io::ErrorKind::NotFound.into()),
+                }
+            }
+
+            pub fn deregister(&mut self) -> io::Result<()> {
+                match self.inner.as_mut() {
+                    Some(state) => {
+                        self.inner = None;
+                        Ok(())
+                    }
+                    None => Err(io::ErrorKind::NotFound.into()),
+                }
             }
         }
     }

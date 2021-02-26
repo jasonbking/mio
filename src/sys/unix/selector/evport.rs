@@ -1,42 +1,24 @@
 use crate::{Interest, Token};
 use log::error;
-use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::os::unix::io::{AsRawFd, RawFd};
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
 use std::time::Duration;
 use std::{cmp, io, ptr};
 
 use libc::PORT_SOURCE_FD;
-use libc::{self, c_int, c_uint};
-use libc::{POLLHUP, POLLIN, POLLOUT};
+use libc::{self, c_uint};
+use libc::{POLLIN, POLLOUT};
 
 #[cfg(debug_assertions)]
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
-
-// mio assumes that once a fd is registered, it will generate events until
-// unregistered. event ports are always one shot, so we must keep track
-// of the token values
-#[derive(Debug)]
-struct TokenInfo {
-    token: Token,
-    flags: c_int,
-    needs_rearm: bool,
-}
 
 #[derive(Debug)]
 pub struct Selector {
     #[cfg(debug_assertions)]
     id: usize,
     port: RawFd,
-    /// Determines if fd_to_reassociate is empty or not, without having to
-    /// acquire the mutex
-    has_fd_to_reassociate: AtomicBool,
-    /// All fd port events are one-shot, so we must keep track of fds
-    /// to reassociate after an event has been fired
-    fd_to_reassociate: Mutex<HashMap<RawFd, TokenInfo>>,
     #[cfg(debug_assertions)]
     has_waker: AtomicBool,
 }
@@ -49,10 +31,6 @@ impl Selector {
                 #[cfg(debug_assertions)]
                 id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 port: p,
-                #[cfg(debug_assertions)]
-                has_fd_to_reassociate: AtomicBool::new(false),
-                #[cfg(debug_assertions)]
-                fd_to_reassociate: Mutex::new(HashMap::new()),
                 has_waker: AtomicBool::new(false),
             })
     }
@@ -63,8 +41,6 @@ impl Selector {
             #[cfg(debug_assertions)]
             id: self.id,
             port: port,
-            has_fd_to_reassociate: AtomicBool::new(false),
-            fd_to_reassociate: Mutex::new(HashMap::new()),
             has_waker: AtomicBool::new(false),
         })
     }
@@ -85,23 +61,6 @@ impl Selector {
 
         events.clear();
 
-        if self.has_fd_to_reassociate.load(Ordering::Acquire) {
-            let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
-            for (fd, ti) in fd_to_reassociate_lock.iter_mut() {
-                if ti.needs_rearm {
-                    syscall!(port_associate(
-                        self.port,
-                        PORT_SOURCE_FD,
-                        *fd as usize,
-                        ti.flags,
-                        ti.token.0 as *mut libc::c_void,
-                    ))?;
-                    ti.needs_rearm = false;
-                }
-            }
-            self.has_fd_to_reassociate.store(false, Ordering::Relaxed);
-        }
-
         let mut nget: u32 = 1;
         syscall!(port_getn(
             self.port,
@@ -114,35 +73,6 @@ impl Selector {
         // If port_getn() succeeds, nget will contain the number of
         // entries, so this is safe.
         unsafe { events.set_len(nget as usize) };
-
-        let mut reassociate = false;
-
-        let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
-        for evt in events.iter() {
-            if evt.portev_source as c_int == libc::PORT_SOURCE_USER {
-                continue;
-            }
-
-            // Only fds are supported for now
-            assert!(evt.portev_source as c_int == libc::PORT_SOURCE_FD);
-
-            let ti = fd_to_reassociate_lock.get_mut(&(evt.portev_object as RawFd));
-
-            if (evt.portev_events & POLLHUP as c_int) != 0 {
-                fd_to_reassociate_lock.remove(&(evt.portev_object as RawFd));
-            } else {
-                ti.unwrap().needs_rearm = true;
-                reassociate = true;
-            }
-        }
-
-        if reassociate {
-            self.has_fd_to_reassociate.store(true, Ordering::Relaxed);
-        }
-
-        if fd_to_reassociate_lock.len() == 0 {
-            self.has_fd_to_reassociate.store(false, Ordering::Relaxed);
-        }
 
         Ok(())
     }
@@ -157,19 +87,6 @@ impl Selector {
         if interests.is_writable() {
             flags |= POLLOUT;
         }
-
-        // Since we need to re-arm the fd after we get an event, we need
-        // to keep track of the flags used when registering so that we can
-        // re-associate the fd with the same flags after an event is received
-        let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
-        fd_to_reassociate_lock
-            .entry(fd)
-            .and_modify(|ti| ti.flags = flags as c_int)
-            .or_insert(TokenInfo {
-                token: token,
-                flags: flags as c_int,
-                needs_rearm: false,
-            });
 
         syscall!(port_associate(
             self.port,
@@ -186,12 +103,6 @@ impl Selector {
     }
 
     pub fn deregister(&self, fd: RawFd) -> io::Result<()> {
-        let mut fd_to_reassociate_lock = self.fd_to_reassociate.lock().unwrap();
-        fd_to_reassociate_lock.remove(&fd);
-        if fd_to_reassociate_lock.len() == 0 {
-            self.has_fd_to_reassociate.store(false, Ordering::Relaxed);
-        }
-
         syscall!(port_dissociate(
             self.port,
             libc::PORT_SOURCE_FD,
@@ -281,8 +192,9 @@ pub mod event {
             && event.portev_source as c_int == libc::PORT_SOURCE_FD
     }
 
-    pub fn is_error(_: &Event) -> bool {
-        false
+    pub fn is_error(event: &Event) -> bool {
+        (event.portev_events & libc::POLLERR as c_int) != 0
+            && event.portev_source as c_int == libc::PORT_SOURCE_FD
     }
 
     pub fn is_read_closed(event: &Event) -> bool {

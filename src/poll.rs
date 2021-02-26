@@ -175,8 +175,8 @@ use std::{fmt, io};
 /// | Linux         | [epoll]   |
 /// | NetBSD        | [kqueue]  |
 /// | OpenBSD       | [kqueue]  |
-/// | Solaris       | [epoll]   |
-/// | illumos       | [epoll]   |
+/// | Solaris       | [evport]  |
+/// | illumos       | [evport]  |
 /// | Windows       | [IOCP]    |
 /// | iOS           | [kqueue]  |
 /// | macOS         | [kqueue]  |
@@ -196,6 +196,7 @@ use std::{fmt, io};
 /// kernel.
 ///
 /// [epoll]: http://man7.org/linux/man-pages/man7/epoll.7.html
+/// [evport]: https://illumos.org/man/3c/port_create
 /// [kqueue]: https://www.freebsd.org/cgi/man.cgi?query=kqueue&sektion=2
 /// [IOCP]: https://msdn.microsoft.com/en-us/library/windows/desktop/aa365198(v=vs.85).aspx
 /// [`signalfd`]: http://man7.org/linux/man-pages/man2/signalfd.2.html
