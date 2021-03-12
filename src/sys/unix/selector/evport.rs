@@ -18,31 +18,67 @@ static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 pub struct Selector {
     #[cfg(debug_assertions)]
     id: usize,
-    port: RawFd,
+    inner: Arc<SelectorInner>,
     #[cfg(debug_assertions)]
     has_waker: AtomicBool,
 }
 
 impl Selector {
     pub fn new() -> io::Result<Selector> {
-        syscall!(port_create())
-            .and_then(|p| syscall!(fcntl(p, libc::F_SETFD, libc::FD_CLOEXEC)).map(|_| p))
-            .map(|p| Selector {
-                #[cfg(debug_assertions)]
-                id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-                port: p,
-                has_waker: AtomicBool::new(false),
-            })
+        Selector {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            inner: Arc::new(SelectorInner::new()?),
+            has_waker: AtomicBool::new(false),
+        }
     }
 
     pub fn try_clone(&self) -> io::Result<Selector> {
-        syscall!(dup(self.port)).map(|port| Selector {
+        Selector {
             // It's the same selector, so we use the same id.
             #[cfg(debug_assertions)]
             id: self.id,
-            port: port,
-            has_waker: AtomicBool::new(false),
-        })
+            inner: Arc::clone(&self.inner),
+            has_waker: AtomicBool::new(self.has_waker.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn select(&self, events: &mut Events, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner.select(events, timeout)
+    }
+
+    pub fn register(&self, fd: RawFd, token: Token, interests: Interest) -> io::Result<InternalState> {
+        self.inner.register(&self.inner, fd, token, interests)
+    }
+
+    pub fn reregister(&self, fd: RawFd, token: Token, interests: Interest) -> io::Result<()> {
+        self.inner.register(&self.inner, fd, token, interests)
+    }
+
+    pub fn deregister(&self, fd: RawFd) -> io::Result<()> {
+        self.inner.deregister(fd)
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn register_waker(&self) -> bool {
+        self.has_waker.swap(true, Ordering::AcqRel)
+    }
+
+    pub fn wake(&self, token: Token) -> io::Result<()> {
+        self.inner.wake(token)
+    }
+}
+
+struct SelectorInner {
+    port: RawFd,
+}
+
+impl SelectorInner {
+    pub fn new() -> io::Result<Self> {
+        syscall!(port_create())
+            .and_then(|p| syscall!(fcntl(p, libc::F_SETFD, libc::FD_CLOEXEC)).map(|_| p))
+            .map(|p| SelectorInner {
+                port: p,
+            })
     }
 
     pub fn select(&self, events: &mut Events, timeout: Option<Duration>) -> io::Result<()> {
@@ -77,7 +113,7 @@ impl Selector {
         Ok(())
     }
 
-    pub fn register(&self, fd: RawFd, token: Token, interests: Interest) -> io::Result<()> {
+    pub fn register(this: &Arc<Self>, fd: RawFd, token: Token, interests: Interest) -> io::Result<InternalState> {
         let mut flags = 0;
 
         if interests.is_readable() {
@@ -95,11 +131,12 @@ impl Selector {
             flags as i32,
             token.0 as *mut libc::c_void,
         ))
-        .map(|_| ())
-    }
-
-    pub fn reregister(&self, fd: RawFd, token: Token, interests: Interest) -> io::Result<()> {
-        self.register(fd, token, interests)
+        .map(|_| InternalState {
+            selector: this.clone(),
+            token: token,
+            interests: interests,
+            socket: fd
+        })
     }
 
     pub fn deregister(&self, fd: RawFd) -> io::Result<()> {
@@ -109,11 +146,6 @@ impl Selector {
             fd as libc::uintptr_t
         ))
         .map(|_| ())
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn register_waker(&self) -> bool {
-        self.has_waker.swap(true, Ordering::AcqRel)
     }
 
     pub fn wake(&self, token: Token) -> io::Result<()> {

@@ -64,10 +64,13 @@ cfg_os_poll! {
 
         use crate::{poll, Interest, Registry, Token};
 
+        pub use self::selector::SelectorInner;
+
         struct InternalState {
-            selector: Arc<Selector>,
+            selector: Arc<SelectorInner>,
             token: Token,
             interests: Interest,
+            socket: RawFd,
         }
 
         pub struct IoSourceState {
@@ -120,7 +123,7 @@ cfg_os_poll! {
                 match self.inner.as_mut() {
                     Some(state) => {
                         poll::selector(registry)
-                            .reregister(xx, token, interests)
+                            .reregister(state.socket, token, interests)
                             .map(|()| {
                                 state.token = token;
                                 state.interests = interests;
