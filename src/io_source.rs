@@ -142,7 +142,9 @@ where
     ) -> io::Result<()> {
         #[cfg(debug_assertions)]
         self.selector_id.associate(registry)?;
-        poll::selector(registry).register(self.inner.as_raw_fd(), token, interests)
+        //poll::selector(registry).register(self.inner.as_raw_fd(), token, interests)
+        self.state
+            .register(registry, token, interests, self.inner.as_raw_fd())
     }
 
     fn reregister(

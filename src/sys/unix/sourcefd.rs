@@ -92,7 +92,8 @@ impl<'a> event::Source for SourceFd<'a> {
         token: Token,
         interests: Interest,
     ) -> io::Result<()> {
-        poll::selector(registry).register(*self.0, token, interests)
+        //poll::selector(registry).register(*self.0, token, interests)
+        todo!()
     }
 
     fn reregister(

@@ -1,9 +1,11 @@
+use crate::sys::unix::InternalState;
 use crate::{Interest, Token};
 use log::error;
 use std::ops::{Deref, DerefMut};
 use std::os::unix::io::{AsRawFd, RawFd};
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use std::{cmp, io, ptr};
 
@@ -25,33 +27,38 @@ pub struct Selector {
 
 impl Selector {
     pub fn new() -> io::Result<Selector> {
-        Selector {
+        Ok(Selector {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             inner: Arc::new(SelectorInner::new()?),
             has_waker: AtomicBool::new(false),
-        }
+        })
     }
 
     pub fn try_clone(&self) -> io::Result<Selector> {
-        Selector {
+        Ok(Selector {
             // It's the same selector, so we use the same id.
             #[cfg(debug_assertions)]
             id: self.id,
             inner: Arc::clone(&self.inner),
-            has_waker: AtomicBool::new(self.has_waker.load(Ordering::Acquire),
-        }
+            has_waker: AtomicBool::new(self.has_waker.load(Ordering::Acquire)),
+        })
     }
 
     pub fn select(&self, events: &mut Events, timeout: Option<Duration>) -> io::Result<()> {
         self.inner.select(events, timeout)
     }
 
-    pub fn register(&self, fd: RawFd, token: Token, interests: Interest) -> io::Result<InternalState> {
-        self.inner.register(&self.inner, fd, token, interests)
+    pub fn register(
+        &self,
+        fd: RawFd,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<InternalState> {
+        SelectorInner::register(&self.inner, fd, token, interests)
     }
 
     pub fn reregister(&self, fd: RawFd, token: Token, interests: Interest) -> io::Result<()> {
-        self.inner.register(&self.inner, fd, token, interests)
+        SelectorInner::register(&self.inner, fd, token, interests).map(|_| ())
     }
 
     pub fn deregister(&self, fd: RawFd) -> io::Result<()> {
@@ -68,7 +75,8 @@ impl Selector {
     }
 }
 
-struct SelectorInner {
+#[derive(Debug)]
+pub struct SelectorInner {
     port: RawFd,
 }
 
@@ -76,9 +84,7 @@ impl SelectorInner {
     pub fn new() -> io::Result<Self> {
         syscall!(port_create())
             .and_then(|p| syscall!(fcntl(p, libc::F_SETFD, libc::FD_CLOEXEC)).map(|_| p))
-            .map(|p| SelectorInner {
-                port: p,
-            })
+            .map(|p| SelectorInner { port: p })
     }
 
     pub fn select(&self, events: &mut Events, timeout: Option<Duration>) -> io::Result<()> {
@@ -113,7 +119,38 @@ impl SelectorInner {
         Ok(())
     }
 
-    pub fn register(this: &Arc<Self>, fd: RawFd, token: Token, interests: Interest) -> io::Result<InternalState> {
+    pub fn register(
+        this: &Arc<Self>,
+        fd: RawFd,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<InternalState> {
+        let mut flags = 0;
+
+        if interests.is_readable() {
+            flags |= POLLIN;
+        }
+
+        if interests.is_writable() {
+            flags |= POLLOUT;
+        }
+
+        syscall!(port_associate(
+            this.port,
+            PORT_SOURCE_FD,
+            fd as usize,
+            flags as i32,
+            token.0 as *mut libc::c_void,
+        ))
+        .map(|_| InternalState {
+            selector: this.clone(),
+            token: token,
+            interests: interests,
+            socket: fd,
+        })
+    }
+
+    pub fn reregister(&self, fd: RawFd, token: Token, interests: Interest) -> io::Result<()> {
         let mut flags = 0;
 
         if interests.is_readable() {
@@ -131,12 +168,7 @@ impl SelectorInner {
             flags as i32,
             token.0 as *mut libc::c_void,
         ))
-        .map(|_| InternalState {
-            selector: this.clone(),
-            token: token,
-            interests: interests,
-            socket: fd
-        })
+        .map(|_| ())
     }
 
     pub fn deregister(&self, fd: RawFd) -> io::Result<()> {
@@ -164,13 +196,13 @@ cfg_io_source! {
 
 impl AsRawFd for Selector {
     fn as_raw_fd(&self) -> RawFd {
-        self.port
+        self.inner.port
     }
 }
 
 impl Drop for Selector {
     fn drop(&mut self) {
-        if let Err(err) = syscall!(close(self.port)) {
+        if let Err(err) = syscall!(close(self.inner.port)) {
             error!("error closing event port: {}", err);
         }
     }

@@ -59,14 +59,13 @@ cfg_os_poll! {
     cfg_io_source! {
         use std::io;
         use std::sync::Arc;
-        use std::os::unix::io::AsRawFd;
         use std::os::unix::io::RawFd;
 
         use crate::{poll, Interest, Registry, Token};
 
-        pub use self::selector::SelectorInner;
+        pub(crate) use self::selector::SelectorInner;
 
-        struct InternalState {
+        pub struct InternalState {
             selector: Arc<SelectorInner>,
             token: Token,
             interests: Interest,
@@ -85,13 +84,12 @@ cfg_os_poll! {
             pub fn do_io<T, F, R>(&self, f: F, io: &T) -> io::Result<R>
             where
                 F: FnOnce(&T) -> io::Result<R>,
-                T: AsRawFd,
             {
                 let result = f(io);
                 self.inner.as_ref().map_or(Ok(()), |state| {
                     state
                         .selector
-                        .reregister(io.as_raw_fd(), state.token, state.interests)
+                        .reregister(state.socket, state.token, state.interests)
                 })?;
                 result
             }
@@ -136,6 +134,7 @@ cfg_os_poll! {
             pub fn deregister(&mut self) -> io::Result<()> {
                 match self.inner.as_mut() {
                     Some(state) => {
+                        state.selector.deregister(state.socket);
                         self.inner = None;
                         Ok(())
                     }
